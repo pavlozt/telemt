@@ -4,7 +4,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rand::Rng;
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -369,6 +369,10 @@ async fn load_startup_proxy_config_snapshot(
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let process_started_at = Instant::now();
+    let process_started_at_epoch_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let (config_path, cli_silent, cli_log_level) = parse_cli();
 
     let mut config = match ProxyConfig::load(&config_path) {
@@ -1556,6 +1560,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             let me_pool_api = me_pool.clone();
             let upstream_manager_api = upstream_manager.clone();
             let config_rx_api = config_rx.clone();
+            let admission_rx_api = admission_rx.clone();
             let config_path_api = std::path::PathBuf::from(&config_path);
             let startup_detected_ip_v4 = detected_ip_v4;
             let startup_detected_ip_v6 = detected_ip_v6;
@@ -1567,9 +1572,11 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     me_pool_api,
                     upstream_manager_api,
                     config_rx_api,
+                    admission_rx_api,
                     config_path_api,
                     startup_detected_ip_v4,
                     startup_detected_ip_v6,
+                    process_started_at_epoch_secs,
                 )
                 .await;
             });
