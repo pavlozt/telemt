@@ -24,6 +24,47 @@ enum HandshakeOutcome {
     Handled,
 }
 
+#[must_use = "UserConnectionReservation must be kept alive to retain user/IP reservation until release or drop"]
+struct UserConnectionReservation {
+    stats: Arc<Stats>,
+    ip_tracker: Arc<UserIpTracker>,
+    user: String,
+    ip: IpAddr,
+    active: bool,
+}
+
+impl UserConnectionReservation {
+    fn new(stats: Arc<Stats>, ip_tracker: Arc<UserIpTracker>, user: String, ip: IpAddr) -> Self {
+        Self {
+            stats,
+            ip_tracker,
+            user,
+            ip,
+            active: true,
+        }
+    }
+
+    async fn release(mut self) {
+        if !self.active {
+            return;
+        }
+        self.ip_tracker.remove_ip(&self.user, self.ip).await;
+        self.active = false;
+        self.stats.decrement_user_curr_connects(&self.user);
+    }
+}
+
+impl Drop for UserConnectionReservation {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        self.stats.decrement_user_curr_connects(&self.user);
+        self.ip_tracker.enqueue_cleanup(self.user.clone(), self.ip);
+    }
+}
+
 use crate::config::ProxyConfig;
 use crate::crypto::SecureRandom;
 use crate::error::{HandshakeResult, ProxyError, Result, StreamError};
@@ -45,7 +86,19 @@ use crate::proxy::middle_relay::handle_via_middle_proxy;
 use crate::proxy::route_mode::{RelayRouteMode, RouteRuntimeController};
 
 fn beobachten_ttl(config: &ProxyConfig) -> Duration {
-    Duration::from_secs(config.general.beobachten_minutes.saturating_mul(60))
+    let minutes = config.general.beobachten_minutes;
+    if minutes == 0 {
+        static BEOBACHTEN_ZERO_MINUTES_WARNED: OnceLock<AtomicBool> = OnceLock::new();
+        let warned = BEOBACHTEN_ZERO_MINUTES_WARNED.get_or_init(|| AtomicBool::new(false));
+        if !warned.swap(true, Ordering::Relaxed) {
+            warn!(
+                "general.beobachten_minutes=0 is insecure because entries expire immediately; forcing minimum TTL to 1 minute"
+            );
+        }
+        return Duration::from_secs(60);
+    }
+
+    Duration::from_secs(minutes.saturating_mul(60))
 }
 
 fn record_beobachten_class(
@@ -90,6 +143,10 @@ fn is_trusted_proxy_source(peer_ip: IpAddr, trusted: &[IpNetwork]) -> bool {
     trusted.iter().any(|cidr| cidr.contains(peer_ip))
 }
 
+fn synthetic_local_addr(port: u16) -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], port))
+}
+
 pub async fn handle_client_stream<S>(
     mut stream: S,
     peer: SocketAddr,
@@ -113,9 +170,7 @@ where
     let mut real_peer = normalize_ip(peer);
 
     // For non-TCP streams, use a synthetic local address; may be overridden by PROXY protocol dst
-    let mut local_addr: SocketAddr = format!("0.0.0.0:{}", config.server.port)
-        .parse()
-        .unwrap_or_else(|_| "0.0.0.0:443".parse().unwrap());
+    let mut local_addr = synthetic_local_addr(config.server.port);
 
     if proxy_protocol_enabled {
         let proxy_header_timeout = Duration::from_millis(
@@ -245,7 +300,7 @@ where
                     handle_bad_client(
                         reader,
                         writer,
-                        &mtproto_handshake,
+                        &handshake,
                         real_peer,
                         local_addr,
                         &config,
@@ -426,7 +481,6 @@ impl RunningClientHandler {
     pub async fn run(self) -> Result<()> {
         self.stats.increment_connects_all();
         let peer = self.peer;
-        let _ip_tracker = self.ip_tracker.clone();
         debug!(peer = %peer, "New connection");
 
         if let Err(e) = configure_client_socket(
@@ -557,7 +611,6 @@ impl RunningClientHandler {
 
         let is_tls = tls::is_tls_handshake(&first_bytes[..3]);
         let peer = self.peer;
-        let _ip_tracker = self.ip_tracker.clone();
 
         debug!(peer = %peer, is_tls = is_tls, "Handshake type detected");
 
@@ -570,7 +623,6 @@ impl RunningClientHandler {
 
     async fn handle_tls_client(mut self, first_bytes: [u8; 5], local_addr: SocketAddr) -> Result<HandshakeOutcome> {
         let peer = self.peer;
-        let _ip_tracker = self.ip_tracker.clone();
 
         let tls_len = u16::from_be_bytes([first_bytes[3], first_bytes[4]]) as usize;
 
@@ -661,7 +713,7 @@ impl RunningClientHandler {
                 handle_bad_client(
                     reader,
                     writer,
-                    &mtproto_handshake,
+                    &handshake,
                     peer,
                     local_addr,
                     &config,
@@ -694,7 +746,6 @@ impl RunningClientHandler {
 
     async fn handle_direct_client(mut self, first_bytes: [u8; 5], local_addr: SocketAddr) -> Result<HandshakeOutcome> {
         let peer = self.peer;
-        let _ip_tracker = self.ip_tracker.clone();
 
         if !self.config.general.modes.classic && !self.config.general.modes.secure {
             debug!(peer = %peer, "Non-TLS modes disabled");
@@ -798,10 +849,22 @@ impl RunningClientHandler {
     {
         let user = success.user.clone();
 
-        if let Err(e) = Self::check_user_limits_static(&user, &config, &stats, peer_addr, &ip_tracker).await {
-            warn!(user = %user, error = %e, "User limit exceeded");
-            return Err(e);
-        }
+        let user_limit_reservation =
+            match Self::acquire_user_connection_reservation_static(
+                &user,
+                &config,
+                stats.clone(),
+                peer_addr,
+                ip_tracker,
+            )
+            .await
+            {
+                Ok(reservation) => reservation,
+                Err(e) => {
+                    warn!(user = %user, error = %e, "User admission check failed");
+                    return Err(e);
+                }
+            };
 
         let route_snapshot = route_runtime.snapshot();
         let session_id = rng.u64();
@@ -858,15 +921,68 @@ impl RunningClientHandler {
             )
             .await
         };
-
-        stats.decrement_user_curr_connects(&user);
-        ip_tracker.remove_ip(&user, peer_addr.ip()).await;
+        user_limit_reservation.release().await;
         relay_result
     }
 
+    async fn acquire_user_connection_reservation_static(
+        user: &str,
+        config: &ProxyConfig,
+        stats: Arc<Stats>,
+        peer_addr: SocketAddr,
+        ip_tracker: Arc<UserIpTracker>,
+    ) -> Result<UserConnectionReservation> {
+        if let Some(expiration) = config.access.user_expirations.get(user)
+            && chrono::Utc::now() > *expiration
+        {
+            return Err(ProxyError::UserExpired {
+                user: user.to_string(),
+            });
+        }
+
+        if let Some(quota) = config.access.user_data_quota.get(user)
+            && stats.get_user_total_octets(user) >= *quota
+        {
+            return Err(ProxyError::DataQuotaExceeded {
+                user: user.to_string(),
+            });
+        }
+
+        let limit = config.access.user_max_tcp_conns.get(user).map(|v| *v as u64);
+        if !stats.try_acquire_user_curr_connects(user, limit) {
+            return Err(ProxyError::ConnectionLimitExceeded {
+                user: user.to_string(),
+            });
+        }
+
+        match ip_tracker.check_and_add(user, peer_addr.ip()).await {
+            Ok(()) => {}
+            Err(reason) => {
+                stats.decrement_user_curr_connects(user);
+                warn!(
+                    user = %user,
+                    ip = %peer_addr.ip(),
+                    reason = %reason,
+                    "IP limit exceeded"
+                );
+                return Err(ProxyError::ConnectionLimitExceeded {
+                    user: user.to_string(),
+                });
+            }
+        }
+
+        Ok(UserConnectionReservation::new(
+            stats,
+            ip_tracker,
+            user.to_string(),
+            peer_addr.ip(),
+        ))
+    }
+
+    #[cfg(test)]
     async fn check_user_limits_static(
-        user: &str, 
-        config: &ProxyConfig, 
+        user: &str,
+        config: &ProxyConfig,
         stats: &Stats,
         peer_addr: SocketAddr,
         ip_tracker: &UserIpTracker,
@@ -899,7 +1015,10 @@ impl RunningClientHandler {
         }
 
         match ip_tracker.check_and_add(user, peer_addr.ip()).await {
-            Ok(()) => {}
+            Ok(()) => {
+                ip_tracker.remove_ip(user, peer_addr.ip()).await;
+                stats.decrement_user_curr_connects(user);
+            }
             Err(reason) => {
                 stats.decrement_user_curr_connects(user);
                 warn!(

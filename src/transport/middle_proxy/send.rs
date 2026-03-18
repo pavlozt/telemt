@@ -372,17 +372,20 @@ impl MePool {
                 }
                 let effective_our_addr = SocketAddr::new(w.source_ip, our_addr.port());
                 let (payload, meta) = build_routed_payload(effective_our_addr);
-                match w.tx.try_send(WriterCommand::Data(payload.clone())) {
-                    Ok(()) => {
-                        self.stats.increment_me_writer_pick_success_try_total(pick_mode);
+                match w.tx.clone().try_reserve_owned() {
+                    Ok(permit) => {
                         if !self.registry.bind_writer(conn_id, w.id, meta).await {
                             debug!(
                                 conn_id,
                                 writer_id = w.id,
-                                "ME writer disappeared before bind commit, retrying"
+                                "ME writer disappeared before bind commit, pruning stale writer"
                             );
+                            drop(permit);
+                            self.remove_writer_and_close_clients(w.id).await;
                             continue;
                         }
+                        permit.send(WriterCommand::Data(payload.clone()));
+                        self.stats.increment_me_writer_pick_success_try_total(pick_mode);
                         if w.generation < self.current_generation() {
                             self.stats.increment_pool_stale_pick_total();
                             debug!(
@@ -422,18 +425,21 @@ impl MePool {
             self.stats.increment_me_writer_pick_blocking_fallback_total();
             let effective_our_addr = SocketAddr::new(w.source_ip, our_addr.port());
             let (payload, meta) = build_routed_payload(effective_our_addr);
-            match w.tx.send(WriterCommand::Data(payload.clone())).await {
-                Ok(()) => {
-                    self.stats
-                        .increment_me_writer_pick_success_fallback_total(pick_mode);
+            match w.tx.clone().reserve_owned().await {
+                Ok(permit) => {
                     if !self.registry.bind_writer(conn_id, w.id, meta).await {
                         debug!(
                             conn_id,
                             writer_id = w.id,
-                            "ME writer disappeared before fallback bind commit, retrying"
+                            "ME writer disappeared before fallback bind commit, pruning stale writer"
                         );
+                        drop(permit);
+                        self.remove_writer_and_close_clients(w.id).await;
                         continue;
                     }
+                    permit.send(WriterCommand::Data(payload.clone()));
+                    self.stats
+                        .increment_me_writer_pick_success_fallback_total(pick_mode);
                     if w.generation < self.current_generation() {
                         self.stats.increment_pool_stale_pick_total();
                     }

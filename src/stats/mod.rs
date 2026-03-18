@@ -6,6 +6,7 @@ pub mod beobachten;
 pub mod telemetry;
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -18,6 +19,46 @@ use tracing::debug;
 
 use crate::config::{MeTelemetryLevel, MeWriterPickMode};
 use self::telemetry::TelemetryPolicy;
+
+#[derive(Clone, Copy)]
+enum RouteConnectionGauge {
+    Direct,
+    Middle,
+}
+
+#[must_use = "RouteConnectionLease must be kept alive to hold the connection gauge increment"]
+pub struct RouteConnectionLease {
+    stats: Arc<Stats>,
+    gauge: RouteConnectionGauge,
+    active: bool,
+}
+
+impl RouteConnectionLease {
+    fn new(stats: Arc<Stats>, gauge: RouteConnectionGauge) -> Self {
+        Self {
+            stats,
+            gauge,
+            active: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for RouteConnectionLease {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        match self.gauge {
+            RouteConnectionGauge::Direct => self.stats.decrement_current_connections_direct(),
+            RouteConnectionGauge::Middle => self.stats.decrement_current_connections_me(),
+        }
+    }
+}
 
 // ============= Stats =============
 
@@ -284,6 +325,16 @@ impl Stats {
     }
     pub fn decrement_current_connections_me(&self) {
         Self::decrement_atomic_saturating(&self.current_connections_me);
+    }
+
+    pub fn acquire_direct_connection_lease(self: &Arc<Self>) -> RouteConnectionLease {
+        self.increment_current_connections_direct();
+        RouteConnectionLease::new(self.clone(), RouteConnectionGauge::Direct)
+    }
+
+    pub fn acquire_me_connection_lease(self: &Arc<Self>) -> RouteConnectionLease {
+        self.increment_current_connections_me();
+        RouteConnectionLease::new(self.clone(), RouteConnectionGauge::Middle)
     }
     pub fn increment_handshake_timeouts(&self) {
         if self.telemetry_core_enabled() {
@@ -1457,9 +1508,11 @@ impl Stats {
 // ============= Replay Checker =============
 
 pub struct ReplayChecker {
-    shards: Vec<Mutex<ReplayShard>>,
+    handshake_shards: Vec<Mutex<ReplayShard>>,
+    tls_shards: Vec<Mutex<ReplayShard>>,
     shard_mask: usize,
     window: Duration,
+    tls_window: Duration,
     checks: AtomicU64,
     hits: AtomicU64,
     additions: AtomicU64,
@@ -1536,19 +1589,24 @@ impl ReplayShard {
 
 impl ReplayChecker {
     pub fn new(total_capacity: usize, window: Duration) -> Self {
+        const MIN_TLS_REPLAY_WINDOW: Duration = Duration::from_secs(120);
         let num_shards = 64;
         let shard_capacity = (total_capacity / num_shards).max(1);
         let cap = NonZeroUsize::new(shard_capacity).unwrap();
 
-        let mut shards = Vec::with_capacity(num_shards);
+        let mut handshake_shards = Vec::with_capacity(num_shards);
+        let mut tls_shards = Vec::with_capacity(num_shards);
         for _ in 0..num_shards {
-            shards.push(Mutex::new(ReplayShard::new(cap)));
+            handshake_shards.push(Mutex::new(ReplayShard::new(cap)));
+            tls_shards.push(Mutex::new(ReplayShard::new(cap)));
         }
 
         Self {
-            shards,
+            handshake_shards,
+            tls_shards,
             shard_mask: num_shards - 1,
             window,
+            tls_window: window.max(MIN_TLS_REPLAY_WINDOW),
             checks: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             additions: AtomicU64::new(0),
@@ -1562,46 +1620,60 @@ impl ReplayChecker {
         (hasher.finish() as usize) & self.shard_mask
     }
 
-    fn check_and_add_internal(&self, data: &[u8]) -> bool {
+    fn check_and_add_internal(
+        &self,
+        data: &[u8],
+        shards: &[Mutex<ReplayShard>],
+        window: Duration,
+    ) -> bool {
         self.checks.fetch_add(1, Ordering::Relaxed);
         let idx = self.get_shard_idx(data);
-        let mut shard = self.shards[idx].lock();
+        let mut shard = shards[idx].lock();
         let now = Instant::now();
-        let found = shard.check(data, now, self.window);
+        let found = shard.check(data, now, window);
         if found {
             self.hits.fetch_add(1, Ordering::Relaxed);
         } else {
-            shard.add(data, now, self.window);
+            shard.add(data, now, window);
             self.additions.fetch_add(1, Ordering::Relaxed);
         }
         found
     }
 
-    fn add_only(&self, data: &[u8]) {
+    fn add_only(&self, data: &[u8], shards: &[Mutex<ReplayShard>], window: Duration) {
         self.additions.fetch_add(1, Ordering::Relaxed);
         let idx = self.get_shard_idx(data);
-        let mut shard = self.shards[idx].lock();
-        shard.add(data, Instant::now(), self.window);
+        let mut shard = shards[idx].lock();
+        shard.add(data, Instant::now(), window);
     }
 
     pub fn check_and_add_handshake(&self, data: &[u8]) -> bool {
-        self.check_and_add_internal(data)
+        self.check_and_add_internal(data, &self.handshake_shards, self.window)
     }
 
     pub fn check_and_add_tls_digest(&self, data: &[u8]) -> bool {
-        self.check_and_add_internal(data)
+        self.check_and_add_internal(data, &self.tls_shards, self.tls_window)
     }
 
     // Compatibility helpers (non-atomic split operations) — prefer check_and_add_*.
     pub fn check_handshake(&self, data: &[u8]) -> bool { self.check_and_add_handshake(data) }
-    pub fn add_handshake(&self, data: &[u8]) { self.add_only(data) }
+    pub fn add_handshake(&self, data: &[u8]) {
+        self.add_only(data, &self.handshake_shards, self.window)
+    }
     pub fn check_tls_digest(&self, data: &[u8]) -> bool { self.check_and_add_tls_digest(data) }
-    pub fn add_tls_digest(&self, data: &[u8]) { self.add_only(data) }
+    pub fn add_tls_digest(&self, data: &[u8]) {
+        self.add_only(data, &self.tls_shards, self.tls_window)
+    }
     
     pub fn stats(&self) -> ReplayStats {
         let mut total_entries = 0;
         let mut total_queue_len = 0;
-        for shard in &self.shards {
+        for shard in &self.handshake_shards {
+            let s = shard.lock();
+            total_entries += s.cache.len();
+            total_queue_len += s.queue.len();
+        }
+        for shard in &self.tls_shards {
             let s = shard.lock();
             total_entries += s.cache.len();
             total_queue_len += s.queue.len();
@@ -1614,7 +1686,7 @@ impl ReplayChecker {
             total_hits: self.hits.load(Ordering::Relaxed),
             total_additions: self.additions.load(Ordering::Relaxed),
             total_cleanups: self.cleanups.load(Ordering::Relaxed),
-            num_shards: self.shards.len(),
+            num_shards: self.handshake_shards.len() + self.tls_shards.len(),
             window_secs: self.window.as_secs(),
         }
     }
@@ -1632,10 +1704,17 @@ impl ReplayChecker {
             let now = Instant::now();
             let mut cleaned = 0usize;
             
-            for shard_mutex in &self.shards {
+            for shard_mutex in &self.handshake_shards {
                 let mut shard = shard_mutex.lock();
                 let before = shard.len();
                 shard.cleanup(now, self.window);
+                let after = shard.len();
+                cleaned += before.saturating_sub(after);
+            }
+            for shard_mutex in &self.tls_shards {
+                let mut shard = shard_mutex.lock();
+                let before = shard.len();
+                shard.cleanup(now, self.tls_window);
                 let after = shard.len();
                 cleaned += before.saturating_sub(after);
             }
@@ -1764,7 +1843,7 @@ mod tests {
     fn test_replay_checker_many_keys() {
         let checker = ReplayChecker::new(10_000, Duration::from_secs(60));
         for i in 0..500u32 {
-            checker.add_only(&i.to_le_bytes());
+            checker.add_handshake(&i.to_le_bytes());
         }
         for i in 0..500u32 {
             assert!(checker.check_handshake(&i.to_le_bytes()));
@@ -1772,3 +1851,11 @@ mod tests {
         assert_eq!(checker.stats().total_entries, 500);
     }
 }
+
+#[cfg(test)]
+#[path = "connection_lease_security_tests.rs"]
+mod connection_lease_security_tests;
+
+#[cfg(test)]
+#[path = "replay_checker_security_tests.rs"]
+mod replay_checker_security_tests;

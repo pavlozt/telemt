@@ -11,9 +11,8 @@ use crate::crypto::{sha256_hmac, SecureRandom};
 use crate::error::ProxyError;
 use super::constants::*;
 use std::time::{SystemTime, UNIX_EPOCH};
-use num_bigint::BigUint;
-use num_traits::One;
 use subtle::ConstantTimeEq;
+use x25519_dalek::{X25519_BASEPOINT_BYTES, x25519};
 
 // ============= Public Constants =============
 
@@ -27,10 +26,17 @@ pub const TLS_DIGEST_POS: usize = 11;
 pub const TLS_DIGEST_HALF_LEN: usize = 16;
 
 /// Time skew limits for anti-replay (in seconds)
-pub const TIME_SKEW_MIN: i64 = -20 * 60; // 20 minutes before
-pub const TIME_SKEW_MAX: i64 = 10 * 60;  // 10 minutes after
+///
+/// The default window is intentionally narrow to reduce replay acceptance.
+/// Operators with known clock-drifted clients should tune deployment config
+/// (for example replay-window policy) to match their environment.
+pub const TIME_SKEW_MIN: i64 = -2 * 60; // 2 minutes before
+pub const TIME_SKEW_MAX: i64 = 2 * 60;  // 2 minutes after
 /// Maximum accepted boot-time timestamp (seconds) before skew checks are enforced.
 pub const BOOT_TIME_MAX_SECS: u32 = 7 * 24 * 60 * 60;
+/// Hard cap for boot-time compatibility bypass to avoid oversized acceptance
+/// windows when replay TTL is configured very large.
+pub const BOOT_TIME_COMPAT_MAX_SECS: u32 = 2 * 60;
 
 // ============= Private Constants =============
 
@@ -63,6 +69,7 @@ pub struct TlsValidation {
     /// Client digest for response generation
     pub digest: [u8; TLS_DIGEST_LEN],
     /// Timestamp extracted from digest
+    
     pub timestamp: u32,
 }
 
@@ -117,28 +124,8 @@ impl TlsExtensionBuilder {
         self
     }
 
-    /// Add ALPN extension with a single selected protocol.
-    fn add_alpn(&mut self, proto: &[u8]) -> &mut Self {
-        // Extension type: ALPN (0x0010)
-        self.extensions.extend_from_slice(&extension_type::ALPN.to_be_bytes());
-
-        // ALPN extension format:
-        // extension_data length (2 bytes)
-        //   protocols length (2 bytes)
-        //     protocol name length (1 byte)
-        //     protocol name bytes
-        let proto_len = proto.len() as u8;
-        let list_len: u16 = 1 + u16::from(proto_len);
-        let ext_len: u16 = 2 + list_len;
-
-        self.extensions.extend_from_slice(&ext_len.to_be_bytes());
-        self.extensions.extend_from_slice(&list_len.to_be_bytes());
-        self.extensions.push(proto_len);
-        self.extensions.extend_from_slice(proto);
-        self
-    }
-    
     /// Build final extensions with length prefix
+    
     fn build(self) -> Vec<u8> {
         let mut result = Vec::with_capacity(2 + self.extensions.len());
         
@@ -153,7 +140,7 @@ impl TlsExtensionBuilder {
     }
     
     /// Get current extensions without length prefix (for calculation)
-    #[allow(dead_code)]
+    
     fn as_bytes(&self) -> &[u8] {
         &self.extensions
     }
@@ -173,8 +160,6 @@ struct ServerHelloBuilder {
     compression: u8,
     /// Extensions
     extensions: TlsExtensionBuilder,
-    /// Selected ALPN protocol (if any)
-    alpn: Option<Vec<u8>>,
 }
 
 impl ServerHelloBuilder {
@@ -185,7 +170,6 @@ impl ServerHelloBuilder {
             cipher_suite: cipher_suite::TLS_AES_128_GCM_SHA256,
             compression: 0x00,
             extensions: TlsExtensionBuilder::new(),
-            alpn: None,
         }
     }
     
@@ -200,18 +184,9 @@ impl ServerHelloBuilder {
         self
     }
 
-    fn with_alpn(mut self, proto: Option<Vec<u8>>) -> Self {
-        self.alpn = proto;
-        self
-    }
-    
     /// Build ServerHello message (without record header)
     fn build_message(&self) -> Vec<u8> {
-        let mut ext_builder = self.extensions.clone();
-        if let Some(ref alpn) = self.alpn {
-            ext_builder.add_alpn(alpn);
-        }
-        let extensions = ext_builder.extensions.clone();
+        let extensions = self.extensions.extensions.clone();
         let extensions_len = extensions.len() as u16;
         
         // Calculate total length
@@ -281,6 +256,7 @@ impl ServerHelloBuilder {
 /// Returns validation result if a matching user is found.
 /// The result **must** be used — ignoring it silently bypasses authentication.
 #[must_use]
+
 pub fn validate_tls_handshake(
     handshake: &[u8],
     secrets: &[(String, Vec<u8>)],
@@ -296,9 +272,9 @@ pub fn validate_tls_handshake(
 
 /// Validate TLS ClientHello and cap the boot-time bypass by replay-cache TTL.
 ///
-/// A boot-time timestamp is only accepted when it falls below both
-/// `BOOT_TIME_MAX_SECS` and the configured replay window, preventing timestamp
-/// reuse outside replay cache coverage.
+/// A boot-time timestamp is only accepted when it falls below all three
+/// bounds: `BOOT_TIME_MAX_SECS`, configured replay window, and
+/// `BOOT_TIME_COMPAT_MAX_SECS`, preventing oversized compatibility windows.
 #[must_use]
 pub fn validate_tls_handshake_with_replay_window(
     handshake: &[u8],
@@ -316,7 +292,16 @@ pub fn validate_tls_handshake_with_replay_window(
     };
 
     let replay_window_u32 = u32::try_from(replay_window_secs).unwrap_or(u32::MAX);
-    let boot_time_cap_secs = BOOT_TIME_MAX_SECS.min(replay_window_u32);
+    // Boot-time bypass and ignore_time_skew serve different compatibility paths.
+    // When skew checks are disabled, force boot-time cap to zero to prevent
+    // accidental future coupling of boot-time logic into the ignore-skew path.
+    let boot_time_cap_secs = if ignore_time_skew {
+        0
+    } else {
+        BOOT_TIME_MAX_SECS
+            .min(replay_window_u32)
+            .min(BOOT_TIME_COMPAT_MAX_SECS)
+    };
 
     validate_tls_handshake_at_time_with_boot_cap(
         handshake,
@@ -334,6 +319,7 @@ fn system_time_to_unix_secs(now: SystemTime) -> Option<i64> {
     let d = now.duration_since(UNIX_EPOCH).ok()?;
     i64::try_from(d.as_secs()).ok()
 }
+
 
 fn validate_tls_handshake_at_time(
     handshake: &[u8],
@@ -369,6 +355,9 @@ fn validate_tls_handshake_at_time_with_boot_cap(
     // Extract session ID
     let session_id_len_pos = TLS_DIGEST_POS + TLS_DIGEST_LEN;
     let session_id_len = handshake.get(session_id_len_pos).copied()? as usize;
+    if session_id_len > 32 {
+        return None;
+    }
     let session_id_start = session_id_len_pos + 1;
     
     if handshake.len() < session_id_start + session_id_len {
@@ -411,7 +400,7 @@ fn validate_tls_handshake_at_time_with_boot_cap(
         if !ignore_time_skew {
             // Allow very small timestamps (boot time instead of unix time)
             // This is a quirk in some clients that use uptime instead of real time
-            let is_boot_time = timestamp < boot_time_cap_secs;
+            let is_boot_time = boot_time_cap_secs > 0 && timestamp < boot_time_cap_secs;
             if !is_boot_time {
                 let time_diff = now - i64::from(timestamp);
                 if !(TIME_SKEW_MIN..=TIME_SKEW_MAX).contains(&time_diff) {
@@ -433,27 +422,14 @@ fn validate_tls_handshake_at_time_with_boot_cap(
     })
 }
 
-fn curve25519_prime() -> BigUint {
-    (BigUint::one() << 255) - BigUint::from(19u32)
-}
-
 /// Generate a fake X25519 public key for TLS
 ///
-/// Produces a quadratic residue mod p = 2^255 - 19 by computing n² mod p,
-/// which matches Python/C behavior and avoids DPI fingerprinting.
+/// Uses RFC 7748 X25519 scalar multiplication over the canonical basepoint,
+/// yielding distribution-consistent public keys for anti-fingerprinting.
 pub fn gen_fake_x25519_key(rng: &SecureRandom) -> [u8; 32] {
-    let mut n_bytes = [0u8; 32];
-    n_bytes.copy_from_slice(&rng.bytes(32));
-
-    let n = BigUint::from_bytes_le(&n_bytes);
-    let p = curve25519_prime();
-    let pk = (&n * &n) % &p;
-
-    let mut out = pk.to_bytes_le();
-    out.resize(32, 0);
-    let mut result = [0u8; 32];
-    result.copy_from_slice(&out[..32]);
-    result
+    let mut scalar = [0u8; 32];
+    scalar.copy_from_slice(&rng.bytes(32));
+    x25519(scalar, X25519_BASEPOINT_BYTES)
 }
 
 /// Build TLS ServerHello response
@@ -482,7 +458,6 @@ pub fn build_server_hello(
     let server_hello = ServerHelloBuilder::new(session_id.to_vec())
         .with_x25519_key(&x25519_key)
         .with_tls13_version()
-        .with_alpn(alpn)
         .build_record();
     
     // Build Change Cipher Spec record
@@ -493,8 +468,27 @@ pub fn build_server_hello(
         0x01,       // CCS byte
     ];
     
-    // Build fake certificate (Application Data record)
-    let fake_cert = rng.bytes(fake_cert_len);
+    // Build first encrypted flight mimic as opaque ApplicationData bytes.
+    // Embed a compact EncryptedExtensions-like ALPN block when selected.
+    let mut fake_cert = Vec::with_capacity(fake_cert_len);
+    if let Some(proto) = alpn.as_ref().filter(|p| !p.is_empty() && p.len() <= u8::MAX as usize) {
+        let proto_list_len = 1usize + proto.len();
+        let ext_data_len = 2usize + proto_list_len;
+        let marker_len = 4usize + ext_data_len;
+        if marker_len <= fake_cert_len {
+            fake_cert.extend_from_slice(&0x0010u16.to_be_bytes());
+            fake_cert.extend_from_slice(&(ext_data_len as u16).to_be_bytes());
+            fake_cert.extend_from_slice(&(proto_list_len as u16).to_be_bytes());
+            fake_cert.push(proto.len() as u8);
+            fake_cert.extend_from_slice(proto);
+        }
+    }
+    if fake_cert.len() < fake_cert_len {
+        fake_cert.extend_from_slice(&rng.bytes(fake_cert_len - fake_cert.len()));
+    } else if fake_cert.len() > fake_cert_len {
+        fake_cert.truncate(fake_cert_len);
+    }
+
     let mut app_data_record = Vec::with_capacity(5 + fake_cert_len);
     app_data_record.push(TLS_RECORD_APPLICATION);
     app_data_record.extend_from_slice(&TLS_VERSION);
@@ -506,8 +500,9 @@ pub fn build_server_hello(
     // Build optional NewSessionTicket records (TLS 1.3 handshake messages are encrypted;
     // here we mimic with opaque ApplicationData records of plausible size).
     let mut tickets = Vec::new();
-    if new_session_tickets > 0 {
-        for _ in 0..new_session_tickets {
+    let ticket_count = new_session_tickets.min(4);
+    if ticket_count > 0 {
+        for _ in 0..ticket_count {
             let ticket_len: usize = rng.range(48) + 48; // 48-95 bytes
             let mut record = Vec::with_capacity(5 + ticket_len);
             record.push(TLS_RECORD_APPLICATION);
@@ -705,13 +700,14 @@ pub fn is_tls_handshake(first_bytes: &[u8]) -> bool {
         return false;
     }
     
-    // TLS record header: 0x16 (handshake) 0x03 0x01 (TLS 1.0)
+    // TLS ClientHello commonly uses legacy record versions 0x0301 or 0x0303.
     first_bytes[0] == TLS_RECORD_HANDSHAKE 
         && first_bytes[1] == 0x03 
-        && first_bytes[2] == 0x01
+        && (first_bytes[2] == 0x01 || first_bytes[2] == 0x03)
 }
 
 /// Parse TLS record header, returns (record_type, length)
+
 pub fn parse_tls_record_header(header: &[u8; 5]) -> Option<(u8, u16)> {
     let record_type = header[0];
     let version = [header[1], header[2]];

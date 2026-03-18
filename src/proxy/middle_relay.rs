@@ -1,15 +1,14 @@
-use std::collections::hash_map::DefaultHasher;
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-#[cfg(test)]
-use std::sync::Mutex;
 
 use dashmap::DashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex};
 use tokio::time::timeout;
 use tracing::{debug, trace, warn};
 
@@ -34,13 +33,26 @@ enum C2MeCommand {
 const DESYNC_DEDUP_WINDOW: Duration = Duration::from_secs(60);
 const DESYNC_DEDUP_MAX_ENTRIES: usize = 65_536;
 const DESYNC_DEDUP_PRUNE_SCAN_LIMIT: usize = 1024;
+const DESYNC_FULL_CACHE_EMIT_MIN_INTERVAL: Duration = Duration::from_millis(1000);
 const DESYNC_ERROR_CLASS: &str = "frame_too_large_crypto_desync";
 const C2ME_CHANNEL_CAPACITY_FALLBACK: usize = 128;
 const C2ME_SOFT_PRESSURE_MIN_FREE_SLOTS: usize = 64;
 const C2ME_SENDER_FAIRNESS_BUDGET: usize = 32;
+#[cfg(test)]
+const C2ME_SEND_TIMEOUT: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const C2ME_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const ME_D2C_FLUSH_BATCH_MAX_FRAMES_MIN: usize = 1;
 const ME_D2C_FLUSH_BATCH_MAX_BYTES_MIN: usize = 4096;
+#[cfg(test)]
+const QUOTA_USER_LOCKS_MAX: usize = 64;
+#[cfg(not(test))]
+const QUOTA_USER_LOCKS_MAX: usize = 4_096;
 static DESYNC_DEDUP: OnceLock<DashMap<u64, Instant>> = OnceLock::new();
+static DESYNC_HASHER: OnceLock<RandomState> = OnceLock::new();
+static DESYNC_FULL_CACHE_LAST_EMIT_AT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+static DESYNC_DEDUP_EVER_SATURATED: OnceLock<AtomicBool> = OnceLock::new();
+static QUOTA_USER_LOCKS: OnceLock<DashMap<String, Arc<AsyncMutex<()>>>> = OnceLock::new();
 
 struct RelayForensicsState {
     trace_id: u64,
@@ -80,7 +92,8 @@ impl MeD2cFlushPolicy {
 }
 
 fn hash_value<T: Hash>(value: &T) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let state = DESYNC_HASHER.get_or_init(RandomState::new);
+    let mut hasher = state.build_hasher();
     value.hash(&mut hasher);
     hasher.finish()
 }
@@ -95,6 +108,11 @@ fn should_emit_full_desync(key: u64, all_full: bool, now: Instant) -> bool {
     }
 
     let dedup = DESYNC_DEDUP.get_or_init(DashMap::new);
+    let saturated_before = dedup.len() >= DESYNC_DEDUP_MAX_ENTRIES;
+    let ever_saturated = DESYNC_DEDUP_EVER_SATURATED.get_or_init(|| AtomicBool::new(false));
+    if saturated_before {
+        ever_saturated.store(true, Ordering::Relaxed);
+    }
 
     if let Some(mut seen_at) = dedup.get_mut(&key) {
         if now.duration_since(*seen_at) >= DESYNC_DEDUP_WINDOW {
@@ -106,12 +124,17 @@ fn should_emit_full_desync(key: u64, all_full: bool, now: Instant) -> bool {
 
     if dedup.len() >= DESYNC_DEDUP_MAX_ENTRIES {
         let mut stale_keys = Vec::new();
-        let mut eviction_candidate = None;
+        let mut oldest_candidate: Option<(u64, Instant)> = None;
         for entry in dedup.iter().take(DESYNC_DEDUP_PRUNE_SCAN_LIMIT) {
-            if eviction_candidate.is_none() {
-                eviction_candidate = Some(*entry.key());
+            let key = *entry.key();
+            let seen_at = *entry.value();
+
+            match oldest_candidate {
+                Some((_, oldest_seen)) if seen_at >= oldest_seen => {}
+                _ => oldest_candidate = Some((key, seen_at)),
             }
-            if now.duration_since(*entry.value()) >= DESYNC_DEDUP_WINDOW {
+
+            if now.duration_since(seen_at) >= DESYNC_DEDUP_WINDOW {
                 stale_keys.push(*entry.key());
             }
         }
@@ -119,23 +142,78 @@ fn should_emit_full_desync(key: u64, all_full: bool, now: Instant) -> bool {
             dedup.remove(&stale_key);
         }
         if dedup.len() >= DESYNC_DEDUP_MAX_ENTRIES {
-            let Some(evict_key) = eviction_candidate else {
+            let Some((evict_key, _)) = oldest_candidate else {
                 return false;
             };
             dedup.remove(&evict_key);
             dedup.insert(key, now);
-            return false;
+            return should_emit_full_desync_full_cache(now);
         }
     }
 
     dedup.insert(key, now);
-    true
+    let saturated_after = dedup.len() >= DESYNC_DEDUP_MAX_ENTRIES;
+    // Preserve the first sequential insert that reaches capacity as a normal
+    // emit, while still gating concurrent newcomer churn after the cache has
+    // ever been observed at saturation.
+    let was_ever_saturated = if saturated_after {
+        ever_saturated.swap(true, Ordering::Relaxed)
+    } else {
+        ever_saturated.load(Ordering::Relaxed)
+    };
+
+    if saturated_before || (saturated_after && was_ever_saturated) {
+        should_emit_full_desync_full_cache(now)
+    } else {
+        true
+    }
+}
+
+fn should_emit_full_desync_full_cache(now: Instant) -> bool {
+    let gate = DESYNC_FULL_CACHE_LAST_EMIT_AT.get_or_init(|| Mutex::new(None));
+    let Ok(mut last_emit_at) = gate.lock() else {
+        return false;
+    };
+
+    match *last_emit_at {
+        None => {
+            *last_emit_at = Some(now);
+            true
+        }
+        Some(last) => {
+            let Some(elapsed) = now.checked_duration_since(last) else {
+                *last_emit_at = Some(now);
+                return true;
+            };
+            if elapsed >= DESYNC_FULL_CACHE_EMIT_MIN_INTERVAL {
+                *last_emit_at = Some(now);
+                true
+            } else {
+                false
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 fn clear_desync_dedup_for_testing() {
     if let Some(dedup) = DESYNC_DEDUP.get() {
         dedup.clear();
+    }
+    if let Some(ever_saturated) = DESYNC_DEDUP_EVER_SATURATED.get() {
+        ever_saturated.store(false, Ordering::Relaxed);
+    }
+    if let Some(last_emit_at) = DESYNC_FULL_CACHE_LAST_EMIT_AT.get() {
+        match last_emit_at.lock() {
+            Ok(mut guard) => {
+                *guard = None;
+            }
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = None;
+                last_emit_at.clear_poison();
+            }
+        }
     }
 }
 
@@ -240,6 +318,46 @@ fn should_yield_c2me_sender(sent_since_yield: usize, has_backlog: bool) -> bool 
     has_backlog && sent_since_yield >= C2ME_SENDER_FAIRNESS_BUDGET
 }
 
+fn quota_exceeded_for_user(stats: &Stats, user: &str, quota_limit: Option<u64>) -> bool {
+    quota_limit.is_some_and(|quota| stats.get_user_total_octets(user) >= quota)
+}
+
+fn quota_would_be_exceeded_for_user(
+    stats: &Stats,
+    user: &str,
+    quota_limit: Option<u64>,
+    bytes: u64,
+) -> bool {
+    quota_limit.is_some_and(|quota| {
+        let used = stats.get_user_total_octets(user);
+        used >= quota || bytes > quota.saturating_sub(used)
+    })
+}
+
+fn quota_user_lock(user: &str) -> Arc<AsyncMutex<()>> {
+    let locks = QUOTA_USER_LOCKS.get_or_init(DashMap::new);
+    if let Some(existing) = locks.get(user) {
+        return Arc::clone(existing.value());
+    }
+
+    if locks.len() >= QUOTA_USER_LOCKS_MAX {
+        locks.retain(|_, value| Arc::strong_count(value) > 1);
+    }
+
+    if locks.len() >= QUOTA_USER_LOCKS_MAX {
+        return Arc::new(AsyncMutex::new(()));
+    }
+
+    let created = Arc::new(AsyncMutex::new(()));
+    match locks.entry(user.to_string()) {
+        dashmap::mapref::entry::Entry::Occupied(entry) => Arc::clone(entry.get()),
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(Arc::clone(&created));
+            created
+        }
+    }
+}
+
 async fn enqueue_c2me_command(
     tx: &mpsc::Sender<C2MeCommand>,
     cmd: C2MeCommand,
@@ -252,7 +370,14 @@ async fn enqueue_c2me_command(
             if tx.capacity() <= C2ME_SOFT_PRESSURE_MIN_FREE_SLOTS {
                 tokio::task::yield_now().await;
             }
-            tx.send(cmd).await
+            match timeout(C2ME_SEND_TIMEOUT, tx.reserve()).await {
+                Ok(Ok(permit)) => {
+                    permit.send(cmd);
+                    Ok(())
+                }
+                Ok(Err(_)) => Err(mpsc::error::SendError(cmd)),
+                Err(_) => Err(mpsc::error::SendError(cmd)),
+            }
         }
     }
 }
@@ -276,6 +401,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let user = success.user.clone();
+    let quota_limit = config.access.user_data_quota.get(&user).copied();
     let peer = success.peer;
     let proto_tag = success.proto_tag;
     let pool_generation = me_pool.current_generation();
@@ -291,7 +417,7 @@ where
     );
 
     let (conn_id, me_rx) = me_pool.registry().register().await;
-    let trace_id = conn_id;
+    let trace_id = session_id;
     let bytes_me2c = Arc::new(AtomicU64::new(0));
     let mut forensics = RelayForensicsState {
         trace_id,
@@ -306,7 +432,7 @@ where
     };
 
     stats.increment_user_connects(&user);
-    stats.increment_current_connections_me();
+    let _me_connection_lease = stats.acquire_me_connection_lease();
 
     if let Some(cutover) = affected_cutover_state(
         &route_rx,
@@ -324,7 +450,6 @@ where
         tokio::time::sleep(delay).await;
         let _ = me_pool.send_close(conn_id).await;
         me_pool.registry().unregister(conn_id).await;
-        stats.decrement_current_connections_me();
         return Err(ProxyError::Proxy(ROUTE_SWITCH_ERROR_MSG.to_string()));
     }
 
@@ -425,6 +550,7 @@ where
                         &mut frame_buf,
                         stats_clone.as_ref(),
                         &user_clone,
+                        quota_limit,
                         bytes_me2c_clone.as_ref(),
                         conn_id,
                         d2c_flush_policy.ack_flush_immediate,
@@ -457,6 +583,7 @@ where
                             &mut frame_buf,
                             stats_clone.as_ref(),
                             &user_clone,
+                            quota_limit,
                             bytes_me2c_clone.as_ref(),
                             conn_id,
                             d2c_flush_policy.ack_flush_immediate,
@@ -489,6 +616,7 @@ where
                                     &mut frame_buf,
                                     stats_clone.as_ref(),
                                     &user_clone,
+                                    quota_limit,
                                     bytes_me2c_clone.as_ref(),
                                     conn_id,
                                     d2c_flush_policy.ack_flush_immediate,
@@ -521,6 +649,7 @@ where
                                         &mut frame_buf,
                                         stats_clone.as_ref(),
                                         &user_clone,
+                                        quota_limit,
                                         bytes_me2c_clone.as_ref(),
                                         conn_id,
                                         d2c_flush_policy.ack_flush_immediate,
@@ -602,7 +731,19 @@ where
                         forensics.bytes_c2me = forensics
                             .bytes_c2me
                             .saturating_add(payload.len() as u64);
-                        stats.add_user_octets_from(&user, payload.len() as u64);
+                        if let Some(limit) = quota_limit {
+                            let quota_lock = quota_user_lock(&user);
+                            let _quota_guard = quota_lock.lock().await;
+                            stats.add_user_octets_from(&user, payload.len() as u64);
+                            if quota_exceeded_for_user(stats.as_ref(), &user, Some(limit)) {
+                                main_result = Err(ProxyError::DataQuotaExceeded {
+                                    user: user.clone(),
+                                });
+                                break;
+                            }
+                        } else {
+                            stats.add_user_octets_from(&user, payload.len() as u64);
+                        }
                         let mut flags = proto_flags;
                         if quickack {
                             flags |= RPC_FLAG_QUICKACK;
@@ -672,7 +813,6 @@ where
         "ME relay cleanup"
     );
     me_pool.registry().unregister(conn_id).await;
-    stats.decrement_current_connections_me();
     result
 }
 
@@ -827,6 +967,7 @@ async fn process_me_writer_response<W>(
     frame_buf: &mut Vec<u8>,
     stats: &Stats,
     user: &str,
+    quota_limit: Option<u64>,
     bytes_me2c: &AtomicU64,
     conn_id: u64,
     ack_flush_immediate: bool,
@@ -842,17 +983,47 @@ where
             } else {
                 trace!(conn_id, bytes = data.len(), flags, "ME->C data");
             }
-            bytes_me2c.fetch_add(data.len() as u64, Ordering::Relaxed);
-            stats.add_user_octets_to(user, data.len() as u64);
-            write_client_payload(
-                client_writer,
-                proto_tag,
-                flags,
-                &data,
-                rng,
-                frame_buf,
-            )
-            .await?;
+            let data_len = data.len() as u64;
+            if let Some(limit) = quota_limit {
+                let quota_lock = quota_user_lock(user);
+                let _quota_guard = quota_lock.lock().await;
+                if quota_would_be_exceeded_for_user(stats, user, Some(limit), data_len) {
+                    return Err(ProxyError::DataQuotaExceeded {
+                        user: user.to_string(),
+                    });
+                }
+                write_client_payload(
+                    client_writer,
+                    proto_tag,
+                    flags,
+                    &data,
+                    rng,
+                    frame_buf,
+                )
+                .await?;
+
+                bytes_me2c.fetch_add(data.len() as u64, Ordering::Relaxed);
+                stats.add_user_octets_to(user, data.len() as u64);
+
+                if quota_exceeded_for_user(stats, user, Some(limit)) {
+                    return Err(ProxyError::DataQuotaExceeded {
+                        user: user.to_string(),
+                    });
+                }
+            } else {
+                write_client_payload(
+                    client_writer,
+                    proto_tag,
+                    flags,
+                    &data,
+                    rng,
+                    frame_buf,
+                )
+                .await?;
+
+                bytes_me2c.fetch_add(data.len() as u64, Ordering::Relaxed);
+                stats.add_user_octets_to(user, data.len() as u64);
+            }
 
             Ok(MeWriterResponseOutcome::Continue {
                 frames: 1,

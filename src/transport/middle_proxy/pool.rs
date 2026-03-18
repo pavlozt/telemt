@@ -692,6 +692,7 @@ impl MePool {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn draining_active_runtime(&self) -> u64 {
         self.draining_active_runtime.load(Ordering::Relaxed)
     }
