@@ -130,14 +130,12 @@ jobs:
             pkg-config \
             curl
 
-      # 💾 cache toolchain
       - uses: actions/cache@v4
         if: matrix.target == 'aarch64-unknown-linux-musl'
         with:
           path: ~/.musl-aarch64
           key: musl-toolchain-aarch64-v1
 
-      # 🔥 надёжная установка
       - name: Install aarch64 musl toolchain
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
@@ -145,27 +143,19 @@ jobs:
 
           TOOLCHAIN_DIR="$HOME/.musl-aarch64"
           ARCHIVE="aarch64-linux-musl-cross.tgz"
+          URL="https://github.com/telemt/telemt/releases/download/toolchains/$ARCHIVE"
 
           if [ -x "$TOOLCHAIN_DIR/bin/aarch64-linux-musl-gcc" ]; then
-            echo "✅ musl toolchain already installed"
+            echo "✅ MUSL toolchain already installed"
           else
-            echo "⬇️ downloading musl toolchain..."
+            echo "⬇️ Downloading musl toolchain from Telemt GitHub Releases..."
 
-            download() {
-              url="$1"
-              echo "→ trying $url"
-              curl -fL \
-                --retry 5 \
-                --retry-delay 3 \
-                --connect-timeout 10 \
-                --max-time 120 \
-                -o "$ARCHIVE" "$url" && return 0
-              return 1
-            }
-
-            download "https://musl.cc/$ARCHIVE" || \
-            download "https://more.musl.cc/$ARCHIVE" || \
-            { echo "❌ failed to download musl toolchain"; exit 1; }
+            curl -fL \
+              --retry 5 \
+              --retry-delay 3 \
+              --connect-timeout 10 \
+              --max-time 120 \
+              -o "$ARCHIVE" "$URL"
 
             mkdir -p "$TOOLCHAIN_DIR"
             tar -xzf "$ARCHIVE" --strip-components=1 -C "$TOOLCHAIN_DIR"
