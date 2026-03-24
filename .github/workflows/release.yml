@@ -26,6 +26,9 @@ jobs:
     name: GNU ${{ matrix.target }}
     runs-on: ubuntu-latest
 
+    container:
+      image: rust:slim-bookworm
+
     strategy:
       fail-fast: false
       matrix:
@@ -47,8 +50,8 @@ jobs:
 
       - name: Install deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          apt-get update
+          apt-get install -y \
             build-essential \
             clang \
             lld \
@@ -69,14 +72,10 @@ jobs:
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             export CC=aarch64-linux-gnu-gcc
             export CXX=aarch64-linux-gnu-g++
-            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
-            export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
             export RUSTFLAGS="-C linker=aarch64-linux-gnu-gcc"
           else
             export CC=clang
             export CXX=clang++
-            export CC_x86_64_unknown_linux_gnu=clang
-            export CXX_x86_64_unknown_linux_gnu=clang++
             export RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=lld"
           fi
 
@@ -85,20 +84,19 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          BIN=target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
-
-          cp "$BIN" dist/${{ env.BINARY_NAME }}-${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} dist/telemt
 
           cd dist
-          tar -czf ${{ matrix.asset }}.tar.gz ${{ env.BINARY_NAME }}-${{ matrix.target }}
+          tar -czf ${{ matrix.asset }}.tar.gz \
+            --owner=0 --group=0 --numeric-owner \
+            telemt
+
           sha256sum ${{ matrix.asset }}.tar.gz > ${{ matrix.asset }}.sha256
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: |
-            dist/${{ matrix.asset }}.tar.gz
-            dist/${{ matrix.asset }}.sha256
+          path: dist/*
 
 # ==========================
 # MUSL
@@ -125,43 +123,7 @@ jobs:
       - name: Install deps
         run: |
           apt-get update
-          apt-get install -y \
-            musl-tools \
-            pkg-config \
-            curl
-
-      - uses: actions/cache@v4
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        with:
-          path: ~/.musl-aarch64
-          key: musl-toolchain-aarch64-v1
-
-      - name: Install aarch64 musl toolchain
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          set -e
-
-          TOOLCHAIN_DIR="$HOME/.musl-aarch64"
-          ARCHIVE="aarch64-linux-musl-cross.tgz"
-          URL="https://github.com/telemt/telemt/releases/download/toolchains/$ARCHIVE"
-
-          if [ -x "$TOOLCHAIN_DIR/bin/aarch64-linux-musl-gcc" ]; then
-            echo "✅ MUSL toolchain already installed"
-          else
-            echo "⬇️ Downloading musl toolchain from Telemt GitHub Releases..."
-
-            curl -fL \
-              --retry 5 \
-              --retry-delay 3 \
-              --connect-timeout 10 \
-              --max-time 120 \
-              -o "$ARCHIVE" "$URL"
-
-            mkdir -p "$TOOLCHAIN_DIR"
-            tar -xzf "$ARCHIVE" --strip-components=1 -C "$TOOLCHAIN_DIR"
-          fi
-
-          echo "$TOOLCHAIN_DIR/bin" >> $GITHUB_PATH
+          apt-get install -y musl-tools pkg-config curl
 
       - name: Add rust target
         run: rustup target add ${{ matrix.target }}
@@ -178,11 +140,9 @@ jobs:
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
             export CC=aarch64-linux-musl-gcc
-            export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
             export RUSTFLAGS="-C target-feature=+crt-static -C linker=aarch64-linux-musl-gcc"
           else
             export CC=musl-gcc
-            export CC_x86_64_unknown_linux_musl=musl-gcc
             export RUSTFLAGS="-C target-feature=+crt-static"
           fi
 
@@ -191,69 +151,19 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          BIN=target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
-
-          cp "$BIN" dist/${{ env.BINARY_NAME }}-${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} dist/telemt
 
           cd dist
-          tar -czf ${{ matrix.asset }}.tar.gz ${{ env.BINARY_NAME }}-${{ matrix.target }}
+          tar -czf ${{ matrix.asset }}.tar.gz \
+            --owner=0 --group=0 --numeric-owner \
+            telemt
+
           sha256sum ${{ matrix.asset }}.tar.gz > ${{ matrix.asset }}.sha256
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: |
-            dist/${{ matrix.asset }}.tar.gz
-            dist/${{ matrix.asset }}.sha256
-
-# ==========================
-# Docker
-# ==========================
-  docker:
-    name: Docker
-    runs-on: ubuntu-latest
-    needs: [build-gnu, build-musl]
-    continue-on-error: true
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Extract binaries
-        run: |
-          mkdir dist
-          find artifacts -name "*.tar.gz" -exec tar -xzf {} -C dist \;
-
-          cp dist/telemt-x86_64-unknown-linux-musl dist/telemt || true
-
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract version
-        id: vars
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-
-      - name: Build & Push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.vars.outputs.VERSION }}
-            ghcr.io/${{ github.repository }}:latest
-          build-args: |
-            BINARY=dist/telemt
+          path: dist/*
 
 # ==========================
 # Release
@@ -271,7 +181,7 @@ jobs:
         with:
           path: artifacts
 
-      - name: Flatten artifacts
+      - name: Flatten
         run: |
           mkdir dist
           find artifacts -type f -exec cp {} dist/ \;
@@ -281,5 +191,61 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
-          draft: false
-          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+          prerelease: ${{ contains(github.ref, '-') }}
+
+# ==========================
+# Docker (FROM RELEASE)
+# ==========================
+  docker:
+    name: Docker (from release)
+    runs-on: ubuntu-latest
+    needs: release
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gh
+        run: apt-get update && apt-get install -y gh
+
+      - name: Extract version
+        id: vars
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Download binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir dist
+
+          gh release download ${{ steps.vars.outputs.VERSION }} \
+            --repo ${{ github.repository }} \
+            --pattern "telemt-x86_64-linux-musl.tar.gz" \
+            --dir dist
+
+          tar -xzf dist/telemt-x86_64-linux-musl.tar.gz -C dist
+          chmod +x dist/telemt
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.vars.outputs.VERSION }}
+            ghcr.io/${{ github.repository }}:latest
+          build-args: |
+            BINARY=dist/telemt
