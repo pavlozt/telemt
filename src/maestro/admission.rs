@@ -23,10 +23,15 @@ pub(crate) async fn configure_admission_gate(
             let initial_ready = pool.admission_ready_conditional_cast().await;
             let mut fallback_enabled = config.general.me2dc_fallback;
             let mut fast_fallback_enabled = fallback_enabled && config.general.me2dc_fast;
-            let (initial_gate_open, initial_route_mode, initial_fallback_reason) = if initial_ready {
+            let (initial_gate_open, initial_route_mode, initial_fallback_reason) = if initial_ready
+            {
                 (true, RelayRouteMode::Middle, None)
             } else if fast_fallback_enabled {
-                (true, RelayRouteMode::Direct, Some("fast_not_ready_fallback"))
+                (
+                    true,
+                    RelayRouteMode::Direct,
+                    Some("fast_not_ready_fallback"),
+                )
             } else {
                 (false, RelayRouteMode::Middle, None)
             };
@@ -78,7 +83,11 @@ pub(crate) async fn configure_admission_gate(
                         not_ready_since = None;
                         (true, RelayRouteMode::Middle, None)
                     } else if fast_fallback_enabled {
-                        (true, RelayRouteMode::Direct, Some("fast_not_ready_fallback"))
+                        (
+                            true,
+                            RelayRouteMode::Direct,
+                            Some("fast_not_ready_fallback"),
+                        )
                     } else {
                         let not_ready_started_at = *not_ready_since.get_or_insert(now);
                         let not_ready_for = now.saturating_duration_since(not_ready_started_at);
