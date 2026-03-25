@@ -13,6 +13,7 @@ use super::pool::{MePool, RefillDcKey, RefillEndpointKey, WriterContour};
 
 const ME_FLAP_UPTIME_THRESHOLD_SECS: u64 = 20;
 const ME_FLAP_QUARANTINE_SECS: u64 = 25;
+const ME_FLAP_MIN_UPTIME_MILLIS: u64 = 500;
 const ME_REFILL_TOTAL_ATTEMPT_CAP: u32 = 20;
 
 impl MePool {
@@ -35,6 +36,17 @@ impl MePool {
         uptime: Duration,
         reason: &'static str,
     ) {
+        if uptime < Duration::from_millis(ME_FLAP_MIN_UPTIME_MILLIS) {
+            debug!(
+                %addr,
+                reason,
+                uptime_ms = uptime.as_millis(),
+                min_uptime_ms = ME_FLAP_MIN_UPTIME_MILLIS,
+                "Skipping flap quarantine for ultra-short writer lifetime"
+            );
+            return;
+        }
+
         if uptime > Duration::from_secs(ME_FLAP_UPTIME_THRESHOLD_SECS) {
             return;
         }

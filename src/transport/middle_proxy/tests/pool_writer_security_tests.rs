@@ -310,6 +310,36 @@ async fn adversarial_blackhat_single_unexpected_remove_establishes_single_quaran
 }
 
 #[tokio::test]
+async fn remove_ultra_short_uptime_writer_skips_flap_quarantine() {
+    let pool = make_pool().await;
+    let writer_id = 931;
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 12, 0, 131)), 443);
+    let before_total = pool.stats.get_me_endpoint_quarantine_total();
+    let before_unexpected = pool.stats.get_me_endpoint_quarantine_unexpected_total();
+    insert_writer(
+        &pool,
+        writer_id,
+        2,
+        addr,
+        false,
+        Instant::now() - Duration::from_millis(50),
+    )
+    .await;
+
+    pool.remove_writer_and_close_clients(writer_id).await;
+
+    assert!(
+        !pool.is_endpoint_quarantined(addr).await,
+        "ultra-short unexpected lifetime must not quarantine endpoint"
+    );
+    assert_eq!(pool.stats.get_me_endpoint_quarantine_total(), before_total);
+    assert_eq!(
+        pool.stats.get_me_endpoint_quarantine_unexpected_total(),
+        before_unexpected + 1
+    );
+}
+
+#[tokio::test]
 async fn integration_old_uptime_writer_does_not_trigger_flap_quarantine() {
     let pool = make_pool().await;
     let writer_id = 94;
