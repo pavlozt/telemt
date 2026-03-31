@@ -111,11 +111,17 @@ pub fn generate_service_file(init_system: InitSystem, opts: &ServiceOptions) -> 
 /// Generates an enhanced systemd unit file.
 fn generate_systemd_unit(opts: &ServiceOptions) -> String {
     let user_line = opts.user.map(|u| format!("User={}", u)).unwrap_or_default();
-    let group_line = opts.group.map(|g| format!("Group={}", g)).unwrap_or_default();
-    let working_dir = opts.working_dir.map(|d| format!("WorkingDirectory={}", d)).unwrap_or_default();
+    let group_line = opts
+        .group
+        .map(|g| format!("Group={}", g))
+        .unwrap_or_default();
+    let working_dir = opts
+        .working_dir
+        .map(|d| format!("WorkingDirectory={}", d))
+        .unwrap_or_default();
 
     format!(
-r#"[Unit]
+        r#"[Unit]
 Description={description}
 Documentation=https://github.com/telemt/telemt
 After=network-online.target
@@ -176,7 +182,7 @@ fn generate_openrc_script(opts: &ServiceOptions) -> String {
     let group = opts.group.unwrap_or("root");
 
     format!(
-r#"#!/sbin/openrc-run
+        r#"#!/sbin/openrc-run
 # OpenRC init script for telemt
 
 description="{description}"
@@ -218,7 +224,7 @@ fn generate_freebsd_rc_script(opts: &ServiceOptions) -> String {
     let group = opts.group.unwrap_or("wheel");
 
     format!(
-r#"#!/bin/sh
+        r#"#!/bin/sh
 #
 # PROVIDE: telemt
 # REQUIRE: LOGIN NETWORKING
@@ -284,7 +290,7 @@ run_rc_command "$1"
 pub fn installation_instructions(init_system: InitSystem) -> &'static str {
     match init_system {
         InitSystem::Systemd => {
-r#"To install and enable the service:
+            r#"To install and enable the service:
   sudo systemctl daemon-reload
   sudo systemctl enable telemt
   sudo systemctl start telemt
@@ -300,7 +306,7 @@ To reload configuration:
 "#
         }
         InitSystem::OpenRC => {
-r#"To install and enable the service:
+            r#"To install and enable the service:
   sudo chmod +x /etc/init.d/telemt
   sudo rc-update add telemt default
   sudo rc-service telemt start
@@ -313,7 +319,7 @@ To reload configuration:
 "#
         }
         InitSystem::FreeBSDRc => {
-r#"To install and enable the service:
+            r#"To install and enable the service:
   sudo chmod +x /usr/local/etc/rc.d/telemt
   sudo sysrc telemt_enable="YES"
   sudo service telemt start
@@ -326,7 +332,7 @@ To reload configuration:
 "#
         }
         InitSystem::Unknown => {
-r#"No supported init system detected.
+            r#"No supported init system detected.
 You may need to create a service file manually or run telemt directly:
   telemt start /etc/telemt/config.toml
 "#
@@ -369,8 +375,14 @@ mod tests {
 
     #[test]
     fn test_service_file_paths() {
-        assert_eq!(service_file_path(InitSystem::Systemd), "/etc/systemd/system/telemt.service");
+        assert_eq!(
+            service_file_path(InitSystem::Systemd),
+            "/etc/systemd/system/telemt.service"
+        );
         assert_eq!(service_file_path(InitSystem::OpenRC), "/etc/init.d/telemt");
-        assert_eq!(service_file_path(InitSystem::FreeBSDRc), "/usr/local/etc/rc.d/telemt");
+        assert_eq!(
+            service_file_path(InitSystem::FreeBSDRc),
+            "/usr/local/etc/rc.d/telemt"
+        );
     }
 }

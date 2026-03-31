@@ -1329,6 +1329,10 @@ mod tests {
         );
         assert_eq!(cfg.access.users, default_access_users());
         assert_eq!(
+            cfg.access.user_max_tcp_conns_global_each,
+            default_user_max_tcp_conns_global_each()
+        );
+        assert_eq!(
             cfg.access.user_max_unique_ips_mode,
             UserMaxUniqueIpsMode::default()
         );
@@ -1471,6 +1475,10 @@ mod tests {
 
         let access = AccessConfig::default();
         assert_eq!(access.users, default_access_users());
+        assert_eq!(
+            access.user_max_tcp_conns_global_each,
+            default_user_max_tcp_conns_global_each()
+        );
     }
 
     #[test]

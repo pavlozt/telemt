@@ -63,7 +63,10 @@ impl LoggingGuard {
 pub fn init_logging(
     opts: &LoggingOptions,
     initial_filter: &str,
-) -> (reload::Handle<EnvFilter, impl tracing::Subscriber + Send + Sync>, LoggingGuard) {
+) -> (
+    reload::Handle<EnvFilter, impl tracing::Subscriber + Send + Sync>,
+    LoggingGuard,
+) {
     let (filter_layer, filter_handle) = reload::Layer::new(EnvFilter::new(initial_filter));
 
     match &opts.destination {
@@ -101,7 +104,8 @@ pub fn init_logging(
                 // Extract directory and filename prefix
                 let path = Path::new(path);
                 let dir = path.parent().unwrap_or(Path::new("/var/log"));
-                let prefix = path.file_name()
+                let prefix = path
+                    .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("telemt");
 
@@ -182,7 +186,11 @@ impl std::io::Write for SyslogWriter {
             .unwrap_or_else(|_| std::ffi::CString::new("(invalid utf8)").unwrap());
 
         unsafe {
-            libc::syslog(priority, b"%s\0".as_ptr() as *const libc::c_char, c_msg.as_ptr());
+            libc::syslog(
+                priority,
+                b"%s\0".as_ptr() as *const libc::c_char,
+                c_msg.as_ptr(),
+            );
         }
 
         Ok(buf.len())
@@ -255,7 +263,10 @@ mod tests {
     #[test]
     fn test_parse_log_destination_default() {
         let args: Vec<String> = vec![];
-        assert!(matches!(parse_log_destination(&args), LogDestination::Stderr));
+        assert!(matches!(
+            parse_log_destination(&args),
+            LogDestination::Stderr
+        ));
     }
 
     #[test]
@@ -286,6 +297,9 @@ mod tests {
     #[test]
     fn test_parse_log_destination_syslog() {
         let args = vec!["--syslog".to_string()];
-        assert!(matches!(parse_log_destination(&args), LogDestination::Syslog));
+        assert!(matches!(
+            parse_log_destination(&args),
+            LogDestination::Syslog
+        ));
     }
 }

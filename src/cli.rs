@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(unix)]
-use crate::daemon::{self, DaemonOptions, DEFAULT_PID_FILE};
+use crate::daemon::{self, DEFAULT_PID_FILE, DaemonOptions};
 
 /// CLI subcommand to execute.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -437,13 +437,13 @@ pub fn run_init(opts: InitOptions) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[+] Config written to {}", config_path.display());
 
     // 5. Generate and write service file
-    let exe_path = std::env::current_exe()
-        .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/telemt"));
+    let exe_path =
+        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/bin/telemt"));
 
     let service_opts = ServiceOptions {
         exe_path: &exe_path,
         config_path: &config_path,
-        user: None,  // Let systemd/init handle user
+        user: None, // Let systemd/init handle user
         group: None,
         pid_file: "/var/run/telemt.pid",
         working_dir: Some("/var/lib/telemt"),
@@ -623,6 +623,7 @@ fake_cert_len = 2048
 tls_full_cert_ttl_secs = 90
 
 [access]
+user_max_tcp_conns_global_each = 0
 replay_check_len = 65536
 replay_window_secs = 120
 ignore_time_skew = false

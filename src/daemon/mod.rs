@@ -206,7 +206,9 @@ impl PidFile {
         let mut contents = String::new();
         File::open(&self.path)
             .and_then(|mut f| f.read_to_string(&mut contents))
-            .map_err(|e| DaemonError::PidFile(format!("cannot read {}: {}", self.path.display(), e)))?;
+            .map_err(|e| {
+                DaemonError::PidFile(format!("cannot read {}: {}", self.path.display(), e))
+            })?;
 
         let pid: i32 = contents
             .trim()
@@ -269,12 +271,16 @@ impl PidFile {
 
         // Write our PID
         let pid = getpid();
-        let mut file = flock.unlock().map_err(|(_, errno)| {
-            DaemonError::PidFile(format!("unlock failed: {}", errno))
-        })?;
+        let mut file = flock
+            .unlock()
+            .map_err(|(_, errno)| DaemonError::PidFile(format!("unlock failed: {}", errno)))?;
 
         writeln!(file, "{}", pid).map_err(|e| {
-            DaemonError::PidFile(format!("cannot write PID to {}: {}", self.path.display(), e))
+            DaemonError::PidFile(format!(
+                "cannot write PID to {}: {}",
+                self.path.display(),
+                e
+            ))
         })?;
 
         // Re-acquire lock and keep it
@@ -373,7 +379,8 @@ pub fn drop_privileges(user: Option<&str>, group: Option<&str>) -> Result<(), Da
 /// Looks up a user by name and returns their UID.
 fn lookup_user(name: &str) -> Result<Uid, DaemonError> {
     // Use libc getpwnam
-    let c_name = std::ffi::CString::new(name).map_err(|_| DaemonError::UserNotFound(name.to_string()))?;
+    let c_name =
+        std::ffi::CString::new(name).map_err(|_| DaemonError::UserNotFound(name.to_string()))?;
 
     unsafe {
         let pwd = libc::getpwnam(c_name.as_ptr());
@@ -387,7 +394,8 @@ fn lookup_user(name: &str) -> Result<Uid, DaemonError> {
 
 /// Looks up a user's primary GID by username.
 fn lookup_user_primary_gid(name: &str) -> Result<Gid, DaemonError> {
-    let c_name = std::ffi::CString::new(name).map_err(|_| DaemonError::UserNotFound(name.to_string()))?;
+    let c_name =
+        std::ffi::CString::new(name).map_err(|_| DaemonError::UserNotFound(name.to_string()))?;
 
     unsafe {
         let pwd = libc::getpwnam(c_name.as_ptr());
@@ -401,7 +409,8 @@ fn lookup_user_primary_gid(name: &str) -> Result<Gid, DaemonError> {
 
 /// Looks up a group by name and returns its GID.
 fn lookup_group(name: &str) -> Result<Gid, DaemonError> {
-    let c_name = std::ffi::CString::new(name).map_err(|_| DaemonError::GroupNotFound(name.to_string()))?;
+    let c_name =
+        std::ffi::CString::new(name).map_err(|_| DaemonError::GroupNotFound(name.to_string()))?;
 
     unsafe {
         let grp = libc::getgrnam(c_name.as_ptr());
@@ -444,9 +453,8 @@ pub fn signal_pid_file<P: AsRef<Path>>(
         )));
     }
 
-    nix::sys::signal::kill(Pid::from_raw(pid), signal).map_err(|e| {
-        DaemonError::PidFile(format!("cannot signal process {}: {}", pid, e))
-    })?;
+    nix::sys::signal::kill(Pid::from_raw(pid), signal)
+        .map_err(|e| DaemonError::PidFile(format!("cannot signal process {}: {}", pid, e)))?;
 
     Ok(())
 }

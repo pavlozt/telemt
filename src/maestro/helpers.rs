@@ -149,7 +149,9 @@ fn print_help() {
     }
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --data-path <DIR>       Set data directory (absolute path; overrides config value)");
+    eprintln!(
+        "  --data-path <DIR>       Set data directory (absolute path; overrides config value)"
+    );
     eprintln!("  --silent, -s            Suppress info logs");
     eprintln!("  --log-level <LEVEL>     debug|verbose|normal|silent");
     eprintln!("  --help, -h              Show this help");
@@ -173,16 +175,10 @@ fn print_help() {
         eprintln!();
     }
     eprintln!("Setup (fire-and-forget):");
-    eprintln!(
-        "  --init                  Generate config, install systemd service, start"
-    );
+    eprintln!("  --init                  Generate config, install systemd service, start");
     eprintln!("    --port <PORT>          Listen port (default: 443)");
-    eprintln!(
-        "    --domain <DOMAIN>      TLS domain for masking (default: www.google.com)"
-    );
-    eprintln!(
-        "    --secret <HEX>         32-char hex secret (auto-generated if omitted)"
-    );
+    eprintln!("    --domain <DOMAIN>      TLS domain for masking (default: www.google.com)");
+    eprintln!("    --secret <HEX>         32-char hex secret (auto-generated if omitted)");
     eprintln!("    --user <NAME>          Username (default: user)");
     eprintln!("    --config-dir <DIR>     Config directory (default: /etc/telemt)");
     eprintln!("    --no-start             Don't start the service after install");

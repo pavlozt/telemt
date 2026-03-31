@@ -370,7 +370,10 @@ async fn handle(
                 let mut data: Vec<UserActiveIps> = active_ips_map
                     .into_iter()
                     .filter(|(_, ips)| !ips.is_empty())
-                    .map(|(username, active_ips)| UserActiveIps { username, active_ips })
+                    .map(|(username, active_ips)| UserActiveIps {
+                        username,
+                        active_ips,
+                    })
                     .collect();
                 data.sort_by(|a, b| a.username.cmp(&b.username));
                 Ok(success_response(StatusCode::OK, data, revision))

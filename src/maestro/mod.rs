@@ -83,7 +83,6 @@ pub async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
 async fn run_inner(
     daemon_opts: DaemonOptions,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-
     // Acquire PID file if daemonizing or if explicitly requested
     // Keep it alive until shutdown (underscore prefix = intentionally kept for RAII cleanup)
     let _pid_file = if daemon_opts.daemonize || daemon_opts.pid_file.is_some() {
@@ -665,10 +664,7 @@ async fn run_inner(
 
     // Drop privileges after binding sockets (which may require root for port < 1024)
     if daemon_opts.user.is_some() || daemon_opts.group.is_some() {
-        if let Err(e) = drop_privileges(
-            daemon_opts.user.as_deref(),
-            daemon_opts.group.as_deref(),
-        ) {
+        if let Err(e) = drop_privileges(daemon_opts.user.as_deref(), daemon_opts.group.as_deref()) {
             error!(error = %e, "Failed to drop privileges");
             std::process::exit(1);
         }

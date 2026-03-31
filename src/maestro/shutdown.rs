@@ -11,10 +11,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use tokio::signal::unix::{SignalKind, signal};
 #[cfg(not(unix))]
 use tokio::signal;
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::{info, warn};
 
 use crate::stats::Stats;
@@ -94,7 +94,8 @@ async fn perform_shutdown(
 
     // Graceful ME pool shutdown
     if let Some(pool) = &me_pool {
-        match tokio::time::timeout(Duration::from_secs(2), pool.shutdown_send_close_conn_all()).await
+        match tokio::time::timeout(Duration::from_secs(2), pool.shutdown_send_close_conn_all())
+            .await
         {
             Ok(total) => {
                 info!(
@@ -159,15 +160,12 @@ fn dump_stats(stats: &Stats, process_started_at: Instant) {
 /// - SIGUSR1: Log rotation acknowledgment (for external log rotation tools)
 /// - SIGUSR2: Dump runtime status to log
 #[cfg(unix)]
-pub(crate) fn spawn_signal_handlers(
-    stats: Arc<Stats>,
-    process_started_at: Instant,
-) {
+pub(crate) fn spawn_signal_handlers(stats: Arc<Stats>, process_started_at: Instant) {
     tokio::spawn(async move {
-        let mut sigusr1 = signal(SignalKind::user_defined1())
-            .expect("Failed to register SIGUSR1 handler");
-        let mut sigusr2 = signal(SignalKind::user_defined2())
-            .expect("Failed to register SIGUSR2 handler");
+        let mut sigusr1 =
+            signal(SignalKind::user_defined1()).expect("Failed to register SIGUSR1 handler");
+        let mut sigusr2 =
+            signal(SignalKind::user_defined2()).expect("Failed to register SIGUSR2 handler");
 
         loop {
             tokio::select! {
@@ -184,10 +182,7 @@ pub(crate) fn spawn_signal_handlers(
 
 /// No-op on non-Unix platforms.
 #[cfg(not(unix))]
-pub(crate) fn spawn_signal_handlers(
-    _stats: Arc<Stats>,
-    _process_started_at: Instant,
-) {
+pub(crate) fn spawn_signal_handlers(_stats: Arc<Stats>, _process_started_at: Instant) {
     // No SIGUSR1/SIGUSR2 on non-Unix
 }
 

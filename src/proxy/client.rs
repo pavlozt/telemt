@@ -877,7 +877,8 @@ impl RunningClientHandler {
         let first_byte = if self.config.timeouts.client_first_byte_idle_secs == 0 {
             None
         } else {
-            let idle_timeout = Duration::from_secs(self.config.timeouts.client_first_byte_idle_secs);
+            let idle_timeout =
+                Duration::from_secs(self.config.timeouts.client_first_byte_idle_secs);
             let mut first_byte = [0u8; 1];
             match timeout(idle_timeout, self.stream.read(&mut first_byte)).await {
                 Ok(Ok(0)) => {
@@ -1365,7 +1366,11 @@ impl RunningClientHandler {
             .access
             .user_max_tcp_conns
             .get(user)
-            .map(|v| *v as u64);
+            .copied()
+            .filter(|limit| *limit > 0)
+            .or((config.access.user_max_tcp_conns_global_each > 0)
+                .then_some(config.access.user_max_tcp_conns_global_each))
+            .map(|v| v as u64);
         if !stats.try_acquire_user_curr_connects(user, limit) {
             return Err(ProxyError::ConnectionLimitExceeded {
                 user: user.to_string(),
@@ -1424,7 +1429,11 @@ impl RunningClientHandler {
             .access
             .user_max_tcp_conns
             .get(user)
-            .map(|v| *v as u64);
+            .copied()
+            .filter(|limit| *limit > 0)
+            .or((config.access.user_max_tcp_conns_global_each > 0)
+                .then_some(config.access.user_max_tcp_conns_global_each))
+            .map(|v| v as u64);
         if !stats.try_acquire_user_curr_connects(user, limit) {
             return Err(ProxyError::ConnectionLimitExceeded {
                 user: user.to_string(),

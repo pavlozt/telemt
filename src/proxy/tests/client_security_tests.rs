@@ -1740,7 +1740,8 @@ async fn fragmented_tls_mtproto_with_interleaved_ccs_is_accepted() {
         .await
         .unwrap();
     assert_eq!(tls_response_head[0], 0x16);
-    let tls_response_len = u16::from_be_bytes([tls_response_head[3], tls_response_head[4]]) as usize;
+    let tls_response_len =
+        u16::from_be_bytes([tls_response_head[3], tls_response_head[4]]) as usize;
     let mut tls_response_body = vec![0u8; tls_response_len];
     client_side
         .read_exact(&mut tls_response_body)
@@ -2533,14 +2534,16 @@ async fn tcp_limit_rejection_does_not_reserve_ip_or_trigger_rollback() {
 }
 
 #[tokio::test]
-async fn zero_tcp_limit_rejects_without_ip_or_counter_side_effects() {
+async fn zero_tcp_limit_uses_global_fallback_and_rejects_without_side_effects() {
     let mut config = ProxyConfig::default();
     config
         .access
         .user_max_tcp_conns
         .insert("user".to_string(), 0);
+    config.access.user_max_tcp_conns_global_each = 1;
 
     let stats = Stats::new();
+    stats.increment_user_curr_connects("user");
     let ip_tracker = UserIpTracker::new();
     let peer_addr: SocketAddr = "198.51.100.211:50001".parse().unwrap();
 
@@ -2557,7 +2560,72 @@ async fn zero_tcp_limit_rejects_without_ip_or_counter_side_effects() {
         result,
         Err(ProxyError::ConnectionLimitExceeded { user }) if user == "user"
     ));
+    assert_eq!(
+        stats.get_user_curr_connects("user"),
+        1,
+        "TCP-limit rejection must keep pre-existing in-flight connection count unchanged"
+    );
+    assert_eq!(ip_tracker.get_active_ip_count("user").await, 0);
+}
+
+#[tokio::test]
+async fn zero_tcp_limit_with_disabled_global_fallback_is_unlimited() {
+    let mut config = ProxyConfig::default();
+    config
+        .access
+        .user_max_tcp_conns
+        .insert("user".to_string(), 0);
+    config.access.user_max_tcp_conns_global_each = 0;
+
+    let stats = Stats::new();
+    let ip_tracker = UserIpTracker::new();
+    let peer_addr: SocketAddr = "198.51.100.212:50002".parse().unwrap();
+
+    let result = RunningClientHandler::check_user_limits_static(
+        "user",
+        &config,
+        &stats,
+        peer_addr,
+        &ip_tracker,
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "per-user zero with global fallback disabled must not enforce a TCP limit"
+    );
     assert_eq!(stats.get_user_curr_connects("user"), 0);
+    assert_eq!(ip_tracker.get_active_ip_count("user").await, 0);
+}
+
+#[tokio::test]
+async fn global_tcp_fallback_applies_when_per_user_limit_is_missing() {
+    let mut config = ProxyConfig::default();
+    config.access.user_max_tcp_conns_global_each = 1;
+
+    let stats = Stats::new();
+    stats.increment_user_curr_connects("user");
+    let ip_tracker = UserIpTracker::new();
+    let peer_addr: SocketAddr = "198.51.100.213:50003".parse().unwrap();
+
+    let result = RunningClientHandler::check_user_limits_static(
+        "user",
+        &config,
+        &stats,
+        peer_addr,
+        &ip_tracker,
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(ProxyError::ConnectionLimitExceeded { user }) if user == "user"
+    ));
+    assert_eq!(
+        stats.get_user_curr_connects("user"),
+        1,
+        "Global fallback TCP-limit rejection must keep pre-existing counter unchanged"
+    );
     assert_eq!(ip_tracker.get_active_ip_count("user").await, 0);
 }
 

@@ -101,6 +101,11 @@ pub(super) struct EffectiveUserIpPolicyLimits {
 }
 
 #[derive(Serialize)]
+pub(super) struct EffectiveUserTcpPolicyLimits {
+    pub(super) global_each: usize,
+}
+
+#[derive(Serialize)]
 pub(super) struct EffectiveLimitsData {
     pub(super) update_every_secs: u64,
     pub(super) me_reinit_every_secs: u64,
@@ -109,6 +114,7 @@ pub(super) struct EffectiveLimitsData {
     pub(super) upstream: EffectiveUpstreamLimits,
     pub(super) middle_proxy: EffectiveMiddleProxyLimits,
     pub(super) user_ip_policy: EffectiveUserIpPolicyLimits,
+    pub(super) user_tcp_policy: EffectiveUserTcpPolicyLimits,
 }
 
 #[derive(Serialize)]
@@ -288,6 +294,9 @@ pub(super) fn build_limits_effective_data(cfg: &ProxyConfig) -> EffectiveLimitsD
             global_each: cfg.access.user_max_unique_ips_global_each,
             mode: user_max_unique_ips_mode_label(cfg.access.user_max_unique_ips_mode),
             window_secs: cfg.access.user_max_unique_ips_window_secs,
+        },
+        user_tcp_policy: EffectiveUserTcpPolicyLimits {
+            global_each: cfg.access.user_max_tcp_conns_global_each,
         },
     }
 }
