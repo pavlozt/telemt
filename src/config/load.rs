@@ -17,6 +17,11 @@ use super::defaults::*;
 use super::types::*;
 
 const ACCESS_SECRET_BYTES: usize = 16;
+const MAX_ME_WRITER_CMD_CHANNEL_CAPACITY: usize = 16_384;
+const MAX_ME_ROUTE_CHANNEL_CAPACITY: usize = 8_192;
+const MAX_ME_C2ME_CHANNEL_CAPACITY: usize = 8_192;
+const MIN_MAX_CLIENT_FRAME_BYTES: usize = 4 * 1024;
+const MAX_MAX_CLIENT_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedConfig {
@@ -626,17 +631,40 @@ impl ProxyConfig {
                 "general.me_writer_cmd_channel_capacity must be > 0".to_string(),
             ));
         }
+        if config.general.me_writer_cmd_channel_capacity > MAX_ME_WRITER_CMD_CHANNEL_CAPACITY {
+            return Err(ProxyError::Config(format!(
+                "general.me_writer_cmd_channel_capacity must be within [1, {MAX_ME_WRITER_CMD_CHANNEL_CAPACITY}]"
+            )));
+        }
 
         if config.general.me_route_channel_capacity == 0 {
             return Err(ProxyError::Config(
                 "general.me_route_channel_capacity must be > 0".to_string(),
             ));
         }
+        if config.general.me_route_channel_capacity > MAX_ME_ROUTE_CHANNEL_CAPACITY {
+            return Err(ProxyError::Config(format!(
+                "general.me_route_channel_capacity must be within [1, {MAX_ME_ROUTE_CHANNEL_CAPACITY}]"
+            )));
+        }
 
         if config.general.me_c2me_channel_capacity == 0 {
             return Err(ProxyError::Config(
                 "general.me_c2me_channel_capacity must be > 0".to_string(),
             ));
+        }
+        if config.general.me_c2me_channel_capacity > MAX_ME_C2ME_CHANNEL_CAPACITY {
+            return Err(ProxyError::Config(format!(
+                "general.me_c2me_channel_capacity must be within [1, {MAX_ME_C2ME_CHANNEL_CAPACITY}]"
+            )));
+        }
+
+        if !(MIN_MAX_CLIENT_FRAME_BYTES..=MAX_MAX_CLIENT_FRAME_BYTES)
+            .contains(&config.general.max_client_frame)
+        {
+            return Err(ProxyError::Config(format!(
+                "general.max_client_frame must be within [{MIN_MAX_CLIENT_FRAME_BYTES}, {MAX_MAX_CLIENT_FRAME_BYTES}]"
+            )));
         }
 
         if config.general.me_c2me_send_timeout_ms > 60_000 {
@@ -1345,6 +1373,10 @@ mod load_mask_shape_security_tests;
 #[cfg(test)]
 #[path = "tests/load_mask_classifier_prefetch_timeout_security_tests.rs"]
 mod load_mask_classifier_prefetch_timeout_security_tests;
+
+#[cfg(test)]
+#[path = "tests/load_memory_envelope_tests.rs"]
+mod load_memory_envelope_tests;
 
 #[cfg(test)]
 mod tests {

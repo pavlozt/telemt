@@ -786,6 +786,7 @@ async fn run_inner(
         &startup_tracker,
         stats.clone(),
         beobachten.clone(),
+        shared_state.clone(),
         ip_tracker.clone(),
         config_rx.clone(),
     )
