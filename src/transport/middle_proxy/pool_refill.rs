@@ -77,6 +77,12 @@ impl MePool {
             return Vec::new();
         }
 
+        if endpoints.len() == 1 && self.single_endpoint_outage_disable_quarantine() {
+            let mut guard = self.endpoint_quarantine.lock().await;
+            guard.retain(|_, expiry| *expiry > Instant::now());
+            return endpoints.to_vec();
+        }
+
         let mut guard = self.endpoint_quarantine.lock().await;
         let now = Instant::now();
         guard.retain(|_, expiry| *expiry > now);
