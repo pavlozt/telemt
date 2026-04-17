@@ -440,7 +440,7 @@ async fn run_update_cycle(
         match download_proxy_secret_with_max_len_via_upstream(
             cfg.general.proxy_secret_len_max,
             upstream,
-            cfg.general.proxy_secret_url.as_deref()
+            cfg.general.proxy_secret_url.as_deref(),
         )
         .await
         {

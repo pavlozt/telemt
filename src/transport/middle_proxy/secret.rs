@@ -37,7 +37,11 @@ pub(super) fn validate_proxy_secret_len(data_len: usize, max_len: usize) -> Resu
 
 /// Fetch Telegram proxy-secret binary.
 #[allow(dead_code)]
-pub async fn fetch_proxy_secret(cache_path: Option<&str>, max_len: usize, proxy_secret_url: Option<&str>) -> Result<Vec<u8>> {
+pub async fn fetch_proxy_secret(
+    cache_path: Option<&str>,
+    max_len: usize,
+    proxy_secret_url: Option<&str>,
+) -> Result<Vec<u8>> {
     fetch_proxy_secret_with_upstream(cache_path, max_len, proxy_secret_url, None).await
 }
 
@@ -51,7 +55,8 @@ pub async fn fetch_proxy_secret_with_upstream(
     let cache = cache_path.unwrap_or("proxy-secret");
 
     // 1) Try fresh download first.
-    match download_proxy_secret_with_max_len_via_upstream(max_len, upstream, proxy_secret_url).await {
+    match download_proxy_secret_with_max_len_via_upstream(max_len, upstream, proxy_secret_url).await
+    {
         Ok(data) => {
             if let Err(e) = tokio::fs::write(cache, &data).await {
                 warn!(error = %e, "Failed to cache proxy-secret (non-fatal)");
