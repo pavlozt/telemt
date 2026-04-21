@@ -231,7 +231,10 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_expected_handshake_eof, resolve_runtime_config_path};
+    use super::{
+        expected_handshake_close_description, is_expected_handshake_eof, peer_close_description,
+        resolve_runtime_config_path,
+    };
     use crate::error::{ProxyError, StreamError};
 
     #[test]
@@ -313,6 +316,67 @@ mod tests {
             std::io::ErrorKind::UnexpectedEof,
         )));
         assert!(is_expected_handshake_eof(&err));
+    }
+
+    #[test]
+    fn peer_close_description_is_human_readable_for_all_peer_close_kinds() {
+        let cases = [
+            (
+                std::io::ErrorKind::ConnectionReset,
+                "Peer reset TCP connection (RST)",
+            ),
+            (
+                std::io::ErrorKind::ConnectionAborted,
+                "Peer aborted TCP connection during transport",
+            ),
+            (
+                std::io::ErrorKind::BrokenPipe,
+                "Peer closed write side (broken pipe)",
+            ),
+            (
+                std::io::ErrorKind::NotConnected,
+                "Socket was already closed by peer",
+            ),
+        ];
+
+        for (kind, expected) in cases {
+            let err = ProxyError::Io(std::io::Error::from(kind));
+            assert_eq!(peer_close_description(&err), Some(expected));
+        }
+    }
+
+    #[test]
+    fn handshake_close_description_is_human_readable_for_all_expected_kinds() {
+        let cases = [
+            (
+                ProxyError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+                "Peer closed before sending full 64-byte MTProto handshake",
+            ),
+            (
+                ProxyError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+                "Peer reset TCP connection during initial MTProto handshake",
+            ),
+            (
+                ProxyError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionAborted)),
+                "Peer aborted TCP connection during initial MTProto handshake",
+            ),
+            (
+                ProxyError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+                "Peer closed write side before MTProto handshake completed",
+            ),
+            (
+                ProxyError::Io(std::io::Error::from(std::io::ErrorKind::NotConnected)),
+                "Handshake socket was already closed by peer",
+            ),
+            (
+                ProxyError::Stream(StreamError::UnexpectedEof),
+                "Peer closed before sending full 64-byte MTProto handshake",
+            ),
+        ];
+
+        for (err, expected) in cases {
+            assert_eq!(expected_handshake_close_description(&err), Some(expected));
+        }
     }
 }
 
@@ -443,30 +507,65 @@ pub(crate) async fn wait_until_admission_open(admission_rx: &mut watch::Receiver
 }
 
 pub(crate) fn is_expected_handshake_eof(err: &crate::error::ProxyError) -> bool {
-    matches!(
-        err,
-        crate::error::ProxyError::Io(ioe)
-            if matches!(
-                ioe.kind(),
-                std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::NotConnected
-            )
-    ) || matches!(err, crate::error::ProxyError::Stream(crate::error::StreamError::UnexpectedEof))
-        || matches!(
-            err,
-            crate::error::ProxyError::Stream(crate::error::StreamError::Io(ioe))
-                if matches!(
-                    ioe.kind(),
-                    std::io::ErrorKind::UnexpectedEof
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::NotConnected
-                )
-        )
+    expected_handshake_close_description(err).is_some()
+}
+
+pub(crate) fn peer_close_description(err: &crate::error::ProxyError) -> Option<&'static str> {
+    fn from_kind(kind: std::io::ErrorKind) -> Option<&'static str> {
+        match kind {
+            std::io::ErrorKind::ConnectionReset => Some("Peer reset TCP connection (RST)"),
+            std::io::ErrorKind::ConnectionAborted => {
+                Some("Peer aborted TCP connection during transport")
+            }
+            std::io::ErrorKind::BrokenPipe => Some("Peer closed write side (broken pipe)"),
+            std::io::ErrorKind::NotConnected => Some("Socket was already closed by peer"),
+            _ => None,
+        }
+    }
+
+    match err {
+        crate::error::ProxyError::Io(ioe) => from_kind(ioe.kind()),
+        crate::error::ProxyError::Stream(crate::error::StreamError::Io(ioe)) => {
+            from_kind(ioe.kind())
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn expected_handshake_close_description(
+    err: &crate::error::ProxyError,
+) -> Option<&'static str> {
+    fn from_kind(kind: std::io::ErrorKind) -> Option<&'static str> {
+        match kind {
+            std::io::ErrorKind::UnexpectedEof => {
+                Some("Peer closed before sending full 64-byte MTProto handshake")
+            }
+            std::io::ErrorKind::ConnectionReset => {
+                Some("Peer reset TCP connection during initial MTProto handshake")
+            }
+            std::io::ErrorKind::ConnectionAborted => {
+                Some("Peer aborted TCP connection during initial MTProto handshake")
+            }
+            std::io::ErrorKind::BrokenPipe => {
+                Some("Peer closed write side before MTProto handshake completed")
+            }
+            std::io::ErrorKind::NotConnected => {
+                Some("Handshake socket was already closed by peer")
+            }
+            _ => None,
+        }
+    }
+
+    match err {
+        crate::error::ProxyError::Io(ioe) => from_kind(ioe.kind()),
+        crate::error::ProxyError::Stream(crate::error::StreamError::UnexpectedEof) => {
+            Some("Peer closed before sending full 64-byte MTProto handshake")
+        }
+        crate::error::ProxyError::Stream(crate::error::StreamError::Io(ioe)) => {
+            from_kind(ioe.kind())
+        }
+        _ => None,
+    }
 }
 
 pub(crate) async fn load_startup_proxy_config_snapshot(
