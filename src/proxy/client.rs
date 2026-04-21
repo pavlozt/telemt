@@ -331,10 +331,31 @@ fn record_handshake_failure_class(
     error: &ProxyError,
 ) {
     let class = match error {
-        ProxyError::Io(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+        ProxyError::Io(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+            ) =>
+        {
             "expected_64_got_0"
         }
         ProxyError::Stream(StreamError::UnexpectedEof) => "expected_64_got_0",
+        ProxyError::Stream(StreamError::Io(err))
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+            ) =>
+        {
+            "expected_64_got_0"
+        }
         _ => "other",
     };
     record_beobachten_class(beobachten, config, peer_ip, class);

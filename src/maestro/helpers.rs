@@ -231,7 +231,8 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_runtime_config_path;
+    use super::{is_expected_handshake_eof, resolve_runtime_config_path};
+    use crate::error::{ProxyError, StreamError};
 
     #[test]
     fn resolve_runtime_config_path_anchors_relative_to_startup_cwd() {
@@ -298,6 +299,20 @@ mod tests {
         assert_eq!(resolved, startup_cwd.join("config.toml"));
 
         let _ = std::fs::remove_dir(&startup_cwd);
+    }
+
+    #[test]
+    fn expected_handshake_eof_matches_connection_reset() {
+        let err = ProxyError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(is_expected_handshake_eof(&err));
+    }
+
+    #[test]
+    fn expected_handshake_eof_matches_stream_io_unexpected_eof() {
+        let err = ProxyError::Stream(StreamError::Io(std::io::Error::from(
+            std::io::ErrorKind::UnexpectedEof,
+        )));
+        assert!(is_expected_handshake_eof(&err));
     }
 }
 
@@ -428,7 +443,30 @@ pub(crate) async fn wait_until_admission_open(admission_rx: &mut watch::Receiver
 }
 
 pub(crate) fn is_expected_handshake_eof(err: &crate::error::ProxyError) -> bool {
-    err.to_string().contains("expected 64 bytes, got 0")
+    matches!(
+        err,
+        crate::error::ProxyError::Io(ioe)
+            if matches!(
+                ioe.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+            )
+    ) || matches!(err, crate::error::ProxyError::Stream(crate::error::StreamError::UnexpectedEof))
+        || matches!(
+            err,
+            crate::error::ProxyError::Stream(crate::error::StreamError::Io(ioe))
+                if matches!(
+                    ioe.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::NotConnected
+                )
+        )
 }
 
 pub(crate) async fn load_startup_proxy_config_snapshot(
