@@ -880,7 +880,6 @@ pub fn detect_client_hello_tls_version(handshake: &[u8]) -> Option<ClientHelloTl
         return None;
     }
 
-    let mut saw_supported_versions = false;
     while pos + 4 <= ext_end {
         let etype = u16::from_be_bytes([handshake[pos], handshake[pos + 1]]);
         let elen = u16::from_be_bytes([handshake[pos + 2], handshake[pos + 3]]) as usize;
@@ -890,7 +889,6 @@ pub fn detect_client_hello_tls_version(handshake: &[u8]) -> Option<ClientHelloTl
         }
 
         if etype == extension_type::SUPPORTED_VERSIONS {
-            saw_supported_versions = true;
             if elen < 1 {
                 return None;
             }
@@ -920,10 +918,6 @@ pub fn detect_client_hello_tls_version(handshake: &[u8]) -> Option<ClientHelloTl
         }
 
         pos += elen;
-    }
-
-    if saw_supported_versions {
-        return None;
     }
 
     if legacy_version >= 0x0303 {
