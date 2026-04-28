@@ -8,8 +8,8 @@ use crate::stats::Stats;
 
 use super::ApiShared;
 use super::config_store::{
-    AccessSection, ensure_expected_revision, load_config_from_disk, save_access_sections_to_disk,
-    save_config_to_disk,
+    AccessSection, current_revision, ensure_expected_revision, load_config_from_disk,
+    save_access_sections_to_disk,
 };
 use super::model::{
     ApiFailure, CreateUserRequest, CreateUserResponse, PatchUserRequest, RotateSecretRequest,
@@ -176,6 +176,13 @@ pub(super) async fn patch_user(
     expected_revision: Option<String>,
     shared: &ApiShared,
 ) -> Result<(UserInfo, String), ApiFailure> {
+    let touches_users = body.secret.is_some();
+    let touches_user_ad_tags = !matches!(&body.user_ad_tag, Patch::Unchanged);
+    let touches_user_max_tcp_conns = !matches!(&body.max_tcp_conns, Patch::Unchanged);
+    let touches_user_expirations = !matches!(&body.expiration_rfc3339, Patch::Unchanged);
+    let touches_user_data_quota = !matches!(&body.data_quota_bytes, Patch::Unchanged);
+    let touches_user_max_unique_ips = !matches!(&body.max_unique_ips, Patch::Unchanged);
+
     if let Some(secret) = body.secret.as_ref()
         && !is_valid_user_secret(secret)
     {
@@ -265,7 +272,31 @@ pub(super) async fn patch_user(
     cfg.validate()
         .map_err(|e| ApiFailure::bad_request(format!("config validation failed: {}", e)))?;
 
-    let revision = save_config_to_disk(&shared.config_path, &cfg).await?;
+    let mut touched_sections = Vec::new();
+    if touches_users {
+        touched_sections.push(AccessSection::Users);
+    }
+    if touches_user_ad_tags {
+        touched_sections.push(AccessSection::UserAdTags);
+    }
+    if touches_user_max_tcp_conns {
+        touched_sections.push(AccessSection::UserMaxTcpConns);
+    }
+    if touches_user_expirations {
+        touched_sections.push(AccessSection::UserExpirations);
+    }
+    if touches_user_data_quota {
+        touched_sections.push(AccessSection::UserDataQuota);
+    }
+    if touches_user_max_unique_ips {
+        touched_sections.push(AccessSection::UserMaxUniqueIps);
+    }
+
+    let revision = if touched_sections.is_empty() {
+        current_revision(&shared.config_path).await?
+    } else {
+        save_access_sections_to_disk(&shared.config_path, &cfg, &touched_sections).await?
+    };
     drop(_guard);
     match max_unique_ips_change {
         Some(Some(limit)) => shared.ip_tracker.set_user_limit(user, limit).await,
