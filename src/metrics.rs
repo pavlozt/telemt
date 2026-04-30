@@ -3125,6 +3125,21 @@ async fn render_metrics(
     );
     let _ = writeln!(
         out,
+        "# HELP telemt_ip_tracker_cleanup_total Release cleanup decisions by path"
+    );
+    let _ = writeln!(out, "# TYPE telemt_ip_tracker_cleanup_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_ip_tracker_cleanup_total{{path=\"direct\"}} {}",
+        ip_memory.cleanup_direct_releases
+    );
+    let _ = writeln!(
+        out,
+        "telemt_ip_tracker_cleanup_total{{path=\"deferred\"}} {}",
+        ip_memory.cleanup_deferred_releases
+    );
+    let _ = writeln!(
+        out,
         "# HELP telemt_ip_tracker_cap_rejects_total New connection rejects caused by global IP tracker caps"
     );
     let _ = writeln!(out, "# TYPE telemt_ip_tracker_cap_rejects_total counter");
@@ -3476,6 +3491,7 @@ mod tests {
         assert!(output.contains("# TYPE telemt_ip_tracker_users gauge"));
         assert!(output.contains("# TYPE telemt_ip_tracker_entries gauge"));
         assert!(output.contains("# TYPE telemt_ip_tracker_cleanup_queue_len gauge"));
+        assert!(output.contains("# TYPE telemt_ip_tracker_cleanup_total counter"));
         assert!(output.contains("# TYPE telemt_ip_tracker_cap_rejects_total counter"));
         assert!(output.contains("# TYPE telemt_tls_fetch_profile_cache_entries gauge"));
         assert!(output.contains("# TYPE telemt_tls_fetch_profile_cache_cap_drops_total counter"));
